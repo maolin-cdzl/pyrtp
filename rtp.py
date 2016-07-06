@@ -184,3 +184,8 @@ class Source:
             return ((lost_interval << 8) / expected_interval) & 0xFF
 
 
+class RtpStream:
+    def __init__(self,**kwargs):
+        self.profile = kwargs.get('profile',None)
+        self.transport = kwargs.get('transport',None)
+        self.sources = []

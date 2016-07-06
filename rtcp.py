@@ -433,33 +433,29 @@ COMPENSATION = 2.71828 - 1.5
 SESSION_BANDWIDTH = 20.0      # kilobits/second
 
 class Rtcp:
-    def __init__(self):
+    def __init__(self,bandwidth):
         self.we_ssrc = random.randint(1,0xFFFFFFFF)
         self.initial = True
         self.we_sent = False
-        self.rtcp_bw = (SESSION_BANDWIDTH / 360.0) * 1000.0 / 8.0
+        self.bandwidth = bandwidth
+        self.rtcp_bw = bandwidth * 6.25   # bandwidth (kb/s) * 1000 / 8 => bandwidth(B/s) * 5%
+
+        #(360.0 / SESSION_BANDWIDTH) * 1000.0 / 8.0
                                         # The target RTCP bandwidth, i.e., the total bandwidth
                                         # that will be used for RTCP packets by all members of this session,
                                         # in octets per second.  This will be a specified fraction of the
                                         # "session bandwidth" parameter supplied to the application at startup.
-        self.avg_rtcp_size = 20
-        self.tv_prev = 0                # the last time an RTCP packet was transmitted
-        self.tv_next = 0                # the next scheduled transmission time of an RTCP packet
-        self.tv_now = 0                 # the current time
-        self.expect_members = 1         # the estimated number of session members at the time tv_next was last recomputed;
-        self.members = set([self.we_ssrc])
-        self.senders = set()
+        self.avg_rtcp_size = 28 + 20
+        self.tp = 0                     # the last time an RTCP packet was transmitted
+        self.tn = 0                     # the next scheduled transmission time of an RTCP packet
+        self.tc = 0                     # the current time
+        self.pmembers = 1               # the estimated number of session members at the time tn was last recomputed
+        self.members = 1                # the most current estimate for the number of session members
+        self.senders = 0                # the most current estimate for the number of senders in the session
+        self.member_list = set([self.we_ssrc])
+        self.sender_list = set()
 
-    # the most current estimate for the number of session members
-    @property
-    def member_count(self):
-        return len(self.members)
-
-    # the most current estimate for the number of senders in the session
-    @property
-    def sender_count(self):
-        return len(self.senders)
-
+        self.Schedule(RTCP_TYPE.RTCP_RR)
 
     # TODO: need update. this is for multicast algorithm. eChat is unicast.
     def rtcp_interval(self):
@@ -510,21 +506,21 @@ class Rtcp:
             random number uniformly distributed between 0.5*t and 1.5*t.
         '''
         t = t * random.uniform(0.5,1.5)
-        # t = t / COMPENSATION      //what is it for?
+        t = t / COMPENSATION
         return t
 
     '''
         This function is responsible for deciding whether to send an
         RTCP report or BYE packet now, or to reschedule transmission.
-        It is also responsible for updating the expect_members, initial, tv_prev,
+        It is also responsible for updating the pmembers, initial, tp,
         and avg_rtcp_size state variables.  This function should be
         called upon expiration of the event timer used by Schedule().
     '''
     def onExpire(self,e):
         if RTCP_TYPE.TypeOfEvent(e) == RTCP_TYPE.EVENT_BYE:
             t = self.rtcp_interval()
-            tn = self.tv_prev + t
-            if tn <= self.tv_now:
+            tn = self.tp + t
+            if tn <= self.tc:
                 # stream close
                 self.SendByePacket(e)
                 return
@@ -532,17 +528,17 @@ class Rtcp:
                 self.Schedule(tn,e)
         elif RTCP_TYPE.TypeOfEvent(e) == RTCP_TYPE.EVENT_REPORT:
             t = self.rtcp_interval()
-            tn = self.tv_prev + t
-            if tn <= self.tv_now:
+            tn = self.tp + t
+            if tn <= self.tc:
                 self.SendRTCPReport(e)
                 self.avg_rtcp_size = (1.0/16.0) * self.SentPacketSize(e) + (15.0/16.0) * self.avg_rtcp_size
-                self.tv_prev = self.tv_now
+                self.tp = self.tc
                 t = self.rtcp_interval()
-                self.Schedule(t + self.tv_now,e)
+                self.Schedule(t + self.tc,e)
                 self.initial = False
             else:
                 self.Schedule(tn,e)
-            self.expect_members = self.member_count
+            self.pmembers = self.member_count
 
     def onReceive(self,packet,e):
         '''
@@ -553,12 +549,15 @@ class Rtcp:
         if PacketType(packet) == PACKET_RTCP_REPORT:
             if self.NewMember(packet) and RTCP_TYPE.TypeOfEvent(e) == RTCP_TYPE.EVENT_REPORT:
                 self.AddMember(packet)
+                self.members += 1
             self.avg_rtcp_size = (1.0/16.0) * ReceivedPacketSize(packet) + (15.0/16.0) * self.avg_rtcp_size
         elif PacketType(packet) == PACKET_RTP:
             if self.NewMember(packet) and RTCP_TYPE.TypeOfEvent(e) == RTCP_TYPE.EVENT_REPORT:
                 self.AddMember(packet)
+                self.members += 1
             if self.NewSender(packet) and RTCP_TYPE.TypeOfEvent(e) == RTCP_TYPE.EVENT_REPORT:
                 self.AddSender(packet)
+                self.senders += 1
         elif PacketType(packet) == PACKET_BYE:
             self.avg_rtcp_size = (1.0/16.0) * ReceivedPacketSize(packet) + (15.0/16.0) * self.avg_rtcp_size
             if RTCP_TYPE.TypeOfEvent(e) == RTCP_TYPE.EVENT_REPORT:
@@ -567,38 +566,38 @@ class Rtcp:
                 if not self.NewMember(packet):
                     self.RemoveMember(packet)
 
-                if self.member_count < self.expect_members:
-                    tn = self.tv_now + ( float(self.member_count) / self.expect_members ) * (self.tv_next - self.tv_now)
-                    self.tv_prev = self.tv_now - ( float(self.member_count) / self.expect_members ) * (self.tv_now - self.tv_prev)
+                if self.member_count < self.pmembers:
+                    tn = self.tc + ( float(self.member_count) / self.pmembers ) * (self.tn - self.tc)
+                    self.tp = self.tc - ( float(self.member_count) / self.pmembers ) * (self.tc - self.tp)
                     self.Reschedule(tn,e)
-                    self.expect_members = self.member_count
+                    self.pmembers = self.member_count
             elif RTCP_TYPE.TypeOfEvent(e) == RTCP_TYPE.EVENT_BYE:
                 self.member_count += 1
 
     def NewMember(self,m):
-        return m.ssrc in self.members
+        return m.ssrc in self.member_list
 
     def AddMember(self,m):
-        self.members.add( m.ssrc )
+        self.members_list.add( m.ssrc )
 
     def RemoveMember(self,m):
-        self.members.remove(m.ssrc)
+        self.members_list.remove(m.ssrc)
 
     def NewSender(self,m):
-        return m.ssrc in self.senders
+        return m.ssrc in self.sender_list
 
     def AddSender(self,m):
-        self.senders.add(m.ssrc)
+        self.sender_list.add(m.ssrc)
 
     def RemoveSender(self,m):
-        self.senders.remove(m.ssrc)
+        self.sender_list.remove(m.ssrc)
 
     def Schedule(self,tn,e):
-        self.tv_next = tn
+        self.tn = tn
         pass
 
     def Reschedule(self,tn,e):
-        self.tv_next = tn
+        self.tn = tn
         pass
 
     def SendByePacket(self):
